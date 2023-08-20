@@ -1,0 +1,693 @@
+
+from calendar import c
+
+from math import sqrt
+from pdb import find_function
+from math import floor
+from re import I
+from sqlite3 import complete_statement
+from tokenize import PseudoExtras
+from turtle import pen
+from urllib.request import proxy_bypass
+import numpy as np
+import pandas as pd
+import random as rd
+import pandapower as pp
+import pandapower.networks as pn
+import pandapower.control as control
+import pandapower.timeseries as timeseries
+from pandapower.timeseries.data_sources.frame_data import DFData
+from pandapower.timeseries import OutputWriter
+import pandapower.estimation as est
+
+#déclaration des variables globales
+curtailed_est_ind=0
+curtailed_pf=0
+nb_bus=len(pd.read_excel("d:/Documents/PHD/State estimation Bayesian/grid_data time serie.xlsx",sheet_name="bus",index_col=0))
+df_fitness_score_pop=pd.DataFrame(columns=["Individu","score","penalties","probability"])
+df_parents=pd.DataFrame(columns=["Individu","score","penalties","probability"])
+num_parents=0
+deepstudy=0
+n1=0
+n2=0
+#creation du réseau électrique
+def test_net():
+    global net, nb_bus
+    net = pp.create_empty_network()
+    #step 1: creation of buses
+    df = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/grid_data time serie.xlsx",sheet_name="bus",index_col=0)
+    for idx in df.index:
+        pp.create_bus(net, name = df.at[idx,"name"],vn_kv=df.at[idx,"vn_kv"])
+
+    #step 2: creation of the slack bus
+    df = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/grid_data time serie.xlsx",sheet_name="slack",index_col=0)
+    for idx in df.index:
+        pp.create_ext_grid(net,bus=df.at[idx,"bus_id"],vm_pu=df.at[idx,"vm_pu"],va_degree=df.at[idx,"va_degree"])
+
+    #step 3: creation of the edges
+    df = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/grid_data time serie.xlsx",sheet_name="line",index_col=0)
+    for idx in df.index:
+        pp.create_line(net,from_bus =df.at[idx,"from_id"], to_bus=df.at[idx,"to_id"], length_km=df.at[idx,"length"],std_type=df.at[idx,"type"]  )
+    #step 4: creation of the loads
+    df = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/grid_data time serie.xlsx",sheet_name="load_ini",index_col=0)
+    for idx in df.index:
+        pp.create_load(net, bus=df.at[idx,"bus_id"], p_mw=df.at[idx,"P"], q_mvar=df.at[idx,"Q"])
+
+    #step 5: creation of the generators
+    df = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/grid_data time serie.xlsx",sheet_name="gen_ini",index_col=0)
+    for idx in df.index:
+        pp.create_sgen(net, bus=df.at[idx,"bus_id"], p_mw=df.at[idx,"P"], q_mvar=df.at[idx,"Q"])
+    return net
+
+# Calcul de flux de puissance (Power flow) sur les séries temporelles
+def pf_timeserie(nts):
+
+    #step 1: create data source
+        #for generators
+    dfG = pd.read_csv("d:/Documents/PHD/State estimation Bayesian/sgen_timeseries2.csv", index_col=0)
+    dsG = DFData(dfG, multi=True)
+        #for loads
+    dfL = pd.read_csv("d:/Documents/PHD/State estimation Bayesian/load_timeseries2.csv",index_col=0)
+    dsL = DFData(dfL, multi=True)
+    
+    #step 2: initialising ConstControl controller to update values of the regenerative generators ("sgen" elements)
+            # the element_index specifies which elements to update (here all sgens in the net since net.sgen.index is passed)
+            # the controlled variable is "p_mw"
+            # the profile_name are the columns in the csv file (here this is also equal to the sgen indices 0-N )
+    const_sgen = control.ConstControl(net, element='sgen', element_index=net.sgen.index,
+                                    variable='p_mw', data_source=dsG, profile_name=net.sgen.index)
+    const_load = control.ConstControl(net, element='load', element_index=net.load.index,
+                                    variable='p_mw', data_source=dsL, profile_name=net.load.index)
+    
+    #step3: initialising the outputwriter to save data to excel files in the current folder. You can change this to .json, .csv, or .pickle as well
+    ow = OutputWriter(net, output_path="d:/Documents/PHD/State estimation Bayesian/", output_file_type=".csv",csv_separator=",")
+        # adding res load as outputs to be stored
+     
+    ow.log_variable('res_bus','vm_pu')
+    ow.log_variable('res_bus', 'va_degree')
+
+    ow.log_variable('res_bus', 'p_mw')
+    ow.log_variable('res_bus', 'q_mvar')
+
+    ow.log_variable('res_line', 'loading_percent')
+    
+    timeseries.run_timeseries(net)
+
+   
+    
+# Fonction pour générer une population initiale n1=#de PMU n2=#inj nb_bus=nb de bus du réseau électrique et nb_pop est nbre d'individu dans la population
+def generate_population(n1,n2,nb_bus,nb_pop):
+    global population
+    population = []
+    for j in range(nb_pop):
+        bus_pot_mes_n2=[]
+        bus_pot_mes_n1=[]
+        list_meas_pop=[]
+        XINJpm= [0] * nb_bus
+        XINJ= [0] * nb_bus
+        XPMU= [0] * nb_bus
+        selected_n3_n2= [0] * nb_bus
+        
+        #creation de bus où se trouveront les pseudos-mesures
+        assigned_bus_n3 = rd.sample(range(nb_bus), nb_bus-n1-n2)
+        for bus in assigned_bus_n3:
+            XINJpm[bus] = 1
+        
+        #creation de la liste des bus qui reste pour les mesures d'injection   
+        for i in range(len(XINJpm)):
+            if XINJpm[i] == 0:
+                bus_pot_mes_n2.append(i)
+        
+        #creation de bus où se trouveront les mesures d'injection
+        assigned_bus_n2 = rd.sample(bus_pot_mes_n2, n2)
+        
+        for bus in assigned_bus_n2:
+            XINJ[bus] = 1
+        
+        #creation de la liste des bus qui reste pour les mesures PMU
+        selected_n3_n2=[i+j for i,j in zip(XINJpm,XINJ)]
+        for i in range(len(selected_n3_n2)):
+            if selected_n3_n2[i] == 0:
+                bus_pot_mes_n1.append(i)
+        for bus in bus_pot_mes_n1:
+            XPMU[bus] = 1        
+        
+        #la fonction suivante permet de vérifier que tous les bus sont bien été assignés
+        #controle=[i+j+k for i,j,k in zip(XPMU,XINJ,XINJpm)]
+        list_meas_pop=[*XPMU , *XINJ, *XINJpm]
+        population.append(list_meas_pop)
+    #print(population[0])
+ 
+    return population
+
+# fonction pour créer pour un individu de la population les mesures correspondantes,le forecast et l'estimation d'état
+def estimate_population(net, ind, n_ts):
+    global rest_line_est_df
+    print("Estimation du candidat")
+    print("=============================") 
+    #step 1: re load result of power flow
+        #/!\ if change in the time serie do not forget to save the result.csv into xls
+        #matrix with pf value of V-pu for each bus and time steps
+    res_bus_pf_vm_pu = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/res_bus/vm_pu.xlsx",sheet_name="Sheet1", index_col=0).to_numpy()
+    pf_vm_pu=np.transpose(res_bus_pf_vm_pu) 
+    
+
+        #matrix with pf value of V angle for each bus and time steps
+    res_bus_pf_va_de = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/res_bus/va_degree.xlsx",sheet_name="Sheet1", index_col=0).to_numpy()
+    pf_va_de=np.transpose(res_bus_pf_va_de) 
+
+        #matrix with pf value of active power for each bus and time steps
+    res_bus_pf_p_mw = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/res_bus/p_mw.xlsx",sheet_name="Sheet1", index_col=0).to_numpy()
+    pf_p_mw=np.transpose(res_bus_pf_p_mw) 
+
+        ##matrix with pf value of reactive power for each bus and time steps
+    res_bus_pf_q_mvar = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/res_bus/q_mvar.xlsx",sheet_name="Sheet1", index_col=0).to_numpy()
+    pf_q_mvar=np.transpose(res_bus_pf_q_mvar)  
+    
+        #NB: for pseudo-measure, the reactive power is considered as a simple factor from the pseudo measure of the active power (cos phi =90 / tan phi = .48)
+
+    #step 2: create random variables for each couple bus-variables and time steps: The first random variable mimics the unaccuracy of the measure and the second random variable mimics the forecast
+    #formula used by the American Electric Power (AEP):  σi = 0.0067Si + 0.0016FSi with Si = apparent power and FSi full scale meter (by convention = 120% of the max value)
+    # for pseudo measure, the value are multiplied by 1.5
+    FSI_vm=1
+    FSI_va=2.75
+    FSI_p=1.2*np.amax(pf_p_mw)
+    FSI_q=1.2*np.amax(pf_q_mvar)
+    FSI_PP=FSI_p
+    FSI_PQ=FSI_q
+    #create zero array for measurement
+    mes_vm_pu=np.zeros((nb_bus,n_ts))
+    mes_va_de=np.zeros((nb_bus,n_ts))
+    mes_p_mw=np.zeros((nb_bus,n_ts))
+    mes_q_mvar=np.zeros((nb_bus,n_ts))
+    pmes_p_mw=np.zeros((nb_bus,n_ts))
+    pmes_q_mvar=np.zeros((nb_bus,n_ts))
+
+    #replace zero with new values corresponding to measurements forecast (note: abs it to ensure that the standars deviation (scale in np.random.normal) is always positive)
+    
+    for idxR in range(nb_bus):
+        for idxC in range(n_ts):
+            if idxC ==n_ts: #pour le dernier time steps, il n'y a pas de forecast
+                mes_vm_pu [idxR][idxC]=pf_vm_pu[idxR][idxC]+np.random.normal(0,abs(0.0033*pf_vm_pu[idxR][idxC] + 0.0008*FSI_vm)*0.001,size=None)
+                #la fonction if a pour objectif d'éliminer les mesures qui sont abhérantes en capant l'écart max par rapport au power flow
+                if pf_vm_pu[idxR][idxC]==1: #/!\ voltage p.u au slack bus =1 !!!!
+                    pf_vm_pu[idxR][idxC]=1
+                elif mes_vm_pu [idxR][idxC]/pf_vm_pu[idxR][idxC] <1.2:
+                    if mes_vm_pu [idxR][idxC]/pf_vm_pu[idxR][idxC] >0.8:
+                        mes_vm_pu [idxR][idxC]=mes_vm_pu [idxR][idxC]
+                    else:
+                        mes_vm_pu [idxR][idxC]=pf_vm_pu [idxR][idxC]*0.8
+                else:
+                    mes_vm_pu [idxR][idxC]=pf_vm_pu [idxR][idxC]*1.2
+                    
+                mes_va_de [idxR][idxC]=pf_va_de[idxR][idxC]*(1+np.random.normal(0,0.0008*FSI_va,size=None))
+                if pf_va_de [idxR][idxC]==0: #/!\ angle au slack bus =0 !!!!
+                    mes_va_de [idxR][idxC]=0
+                elif mes_va_de [idxR][idxC]/pf_va_de[idxR][idxC] <1.2: 
+                    if mes_va_de [idxR][idxC]/pf_va_de[idxR][idxC] >0.8:
+                        mes_va_de [idxR][idxC]=mes_va_de [idxR][idxC]
+                    else:
+                        mes_va_de [idxR][idxC]=pf_va_de [idxR][idxC]*0.8
+                else:
+                    mes_va_de [idxR][idxC]=pf_va_de [idxR][idxC]*1.2
+                    
+                mes_p_mw [idxR][idxC]=pf_p_mw[idxR][idxC]+np.random.normal(0,abs(0.0067*pf_p_mw[idxR][idxC] + 0.0016*FSI_p),size=None)
+                if mes_p_mw [idxR][idxC]/pf_p_mw[idxR][idxC] <1.2:
+                    if mes_p_mw [idxR][idxC]/pf_p_mw[idxR][idxC] >0.8:
+                        mes_p_mw [idxR][idxC]=mes_p_mw [idxR][idxC]
+                    else:
+                        mes_p_mw [idxR][idxC]=pf_p_mw [idxR][idxC]*0.8
+                else:
+                    mes_p_mw [idxR][idxC]=pf_p_mw [idxR][idxC]*1.2
+                
+                mes_q_mvar [idxR][idxC]=pf_q_mvar[idxR][idxC]+np.random.normal(0,abs(0.0067*pf_q_mvar[idxR][idxC] + 0.0016*FSI_q),size=None)
+                if mes_q_mvar [idxR][idxC]/pf_q_mvar[idxR][idxC] <1.2:
+                    if mes_q_mvar [idxR][idxC]/pf_q_mvar[idxR][idxC] >0.8:
+                        mes_q_mvar [idxR][idxC]=mes_q_mvar [idxR][idxC]
+                    else:
+                        mes_q_mvar [idxR][idxC]=pf_q_mvar [idxR][idxC]*0.8
+                else:
+                    mes_q_mvar [idxR][idxC]=pf_q_mvar [idxR][idxC]*1.2               
+                
+                pmes_p_mw [idxR][idxC]=pf_p_mw[idxR][idxC]+np.random.normal(0,3*abs(0.0067*pf_p_mw[idxR][idxC] + 0.0016*FSI_PP),size=None) #pseudo mesures ont le triple d'erreur
+                if pmes_p_mw [idxR][idxC]/pf_p_mw[idxR][idxC] <1.3:
+                    if pmes_p_mw [idxR][idxC]/pf_p_mw[idxR][idxC] >0.7:
+                        pmes_p_mw [idxR][idxC]=mes_p_mw [idxR][idxC]
+                    else:
+                        pmes_p_mw [idxR][idxC]=pf_p_mw [idxR][idxC]*0.7
+                else:
+                    pmes_p_mw [idxR][idxC]=pf_p_mw [idxR][idxC]*1.3                
+                
+                pmes_q_mvar [idxR][idxC]=pf_q_mvar[idxR][idxC]+np.random.normal(0,3*abs(0.0067*pf_q_mvar[idxR][idxC] + 0.0016*FSI_PQ),size=None)
+                if pmes_q_mvar [idxR][idxC]/pf_q_mvar[idxR][idxC] <1.3:
+                    if pmes_q_mvar [idxR][idxC]/pf_q_mvar[idxR][idxC] >0.7:
+                        pmes_q_mvar [idxR][idxC]=mes_q_mvar [idxR][idxC]
+                    else:
+                        pmes_q_mvar [idxR][idxC]=pf_q_mvar [idxR][idxC]*0.7
+                else:
+                    pmes_q_mvar [idxR][idxC]=pf_q_mvar [idxR][idxC]*1.3               
+                
+            else:
+                mes_vm_pu [idxR][idxC]=pf_vm_pu[idxR][idxC+1]+np.random.normal(0,abs(0.0033*pf_vm_pu[idxR][idxC+1] + 0.0008*FSI_vm)*0.001,size=None)+np.random.normal(0,abs(pf_vm_pu[idxR][idxC+1])*0.0025)
+                if pf_vm_pu[idxR][idxC+1]==1: #/!\ voltage p.u au slack bus =1 !!!!
+                    pf_vm_pu[idxR][idxC+1]=1
+                elif mes_vm_pu [idxR][idxC]/pf_vm_pu[idxR][idxC+1] <1.2:
+                    if mes_vm_pu [idxR][idxC]/pf_vm_pu[idxR][idxC+1] >0.8:
+                        mes_vm_pu [idxR][idxC]=mes_vm_pu [idxR][idxC]
+                    else:
+                        mes_vm_pu [idxR][idxC]=pf_vm_pu [idxR][idxC+1]*0.8
+                else:
+                    mes_vm_pu [idxR][idxC]=pf_vm_pu [idxR][idxC+1]*1.2
+
+                mes_va_de [idxR][idxC]=pf_va_de[idxR][idxC+1]*(1+np.random.normal(0,0.0008*FSI_va,size=None))*(1+np.random.normal(0,0.0008*FSI_va,size=None))
+                if pf_va_de[idxR][idxC+1]==0:
+                    mes_va_de [idxR][idxC]=0 #/!\ angle au slack bus =0 !!!!
+                elif mes_va_de [idxR][idxC]/pf_va_de[idxR][idxC+1] <1.2:
+                    if mes_va_de [idxR][idxC]/pf_va_de[idxR][idxC+1] >0.8:
+                        mes_va_de [idxR][idxC]=mes_va_de [idxR][idxC]
+                    else:
+                        mes_va_de [idxR][idxC]=pf_va_de [idxR][idxC+1]*0.8
+                else:
+                    mes_va_de [idxR][idxC]=pf_va_de [idxR][idxC+1]*1.2               
+                
+                mes_p_mw [idxR][idxC]=pf_p_mw[idxR][idxC+1]+np.random.normal(0,abs(0.0067*pf_p_mw[idxR][idxC+1] + 0.0016*FSI_p),size=None)+np.random.normal(0,abs(pf_p_mw[idxR][idxC+1])*0.0025,size=None)
+                if mes_p_mw [idxR][idxC]/pf_p_mw[idxR][idxC+1] <1.2:
+                    if mes_p_mw [idxR][idxC]/pf_p_mw[idxR][idxC+1] >0.8:
+                        mes_p_mw [idxR][idxC]=mes_p_mw [idxR][idxC]
+                    else:
+                        mes_p_mw [idxR][idxC]=pf_p_mw [idxR][idxC+1]*0.8
+                else:
+                    mes_p_mw [idxR][idxC]=pf_p_mw [idxR][idxC+1]*1.2                
+                
+                mes_q_mvar [idxR][idxC]=pf_q_mvar[idxR][idxC+1]+np.random.normal(0,abs(0.0067*pf_q_mvar[idxR][idxC+1] + 0.0016*FSI_q),size=None)+np.random.normal(0,abs(pf_q_mvar[idxR][idxC+1])*0.0025,size=None)
+                if mes_q_mvar [idxR][idxC]/pf_q_mvar[idxR][idxC+1] <1.2:
+                    if mes_q_mvar [idxR][idxC]/pf_q_mvar[idxR][idxC-1] >0.8:
+                        mes_q_mvar [idxR][idxC]=mes_q_mvar [idxR][idxC]
+                    else:
+                        mes_q_mvar [idxR][idxC]=pf_q_mvar [idxR][idxC+1]*0.8               
+                else:
+                    mes_q_mvar [idxR][idxC]=pf_q_mvar [idxR][idxC+1]*1.2
+                     
+                pmes_p_mw [idxR][idxC]=pf_p_mw[idxR][idxC+1]+np.random.normal(0,3*abs(0.0067*pf_p_mw[idxR][idxC+1] + 0.0016*FSI_PP),size=None)+np.random.normal(0,abs(pf_p_mw[idxR][idxC+1])*0.0025,size=None)
+                if pmes_p_mw [idxR][idxC]/pf_p_mw[idxR][idxC+1] <1.3:
+                    if pmes_p_mw [idxR][idxC]/pf_p_mw[idxR][idxC+1] >0.7:
+                        pmes_p_mw [idxR][idxC]=pmes_p_mw [idxR][idxC]
+                    else:
+                        pmes_p_mw [idxR][idxC]=pf_p_mw [idxR][idxC+1]*0.7
+                else:
+                    pmes_p_mw [idxR][idxC]=pf_p_mw [idxR][idxC+1]*1.3                  
+                
+                pmes_q_mvar [idxR][idxC]=pf_q_mvar[idxR][idxC+1]+np.random.normal(0,3*abs(0.0067*pf_q_mvar[idxR][idxC+1] + 0.0016*FSI_PQ),size=None)+np.random.normal(0,abs(pf_q_mvar[idxR][idxC+1])*0.0025,size=None)
+                if pmes_q_mvar [idxR][idxC]/pf_q_mvar[idxR][idxC+1] <1.3:
+                    if pmes_q_mvar [idxR][idxC]/pf_q_mvar[idxR][idxC+1] >0.7:
+                        pmes_q_mvar [idxR][idxC]=pmes_q_mvar [idxR][idxC]
+                    else:
+                        pmes_q_mvar [idxR][idxC]=pf_q_mvar[idxR][idxC+1]*0.7
+                else:
+                    pmes_q_mvar [idxR][idxC]=pf_q_mvar [idxR][idxC+1]*1.3    
+    
+    if deepstudy==1:
+        with pd.ExcelWriter("d:/Documents/PHD/State estimation Bayesian/control.xlsx",engine="openpyxl" ,mode='a') as writer:
+            pd.DataFrame(mes_vm_pu).to_excel(writer, sheet_name="vm_pu")  
+            pd.DataFrame(mes_va_de).to_excel(writer, sheet_name="va_de")  
+            pd.DataFrame(mes_p_mw).to_excel(writer, sheet_name="p_mw")
+            pd.DataFrame(mes_q_mvar).to_excel(writer, sheet_name="q_mvar")
+            pd.DataFrame(pmes_p_mw).to_excel(writer, sheet_name="pmes_p_mw")
+            pd.DataFrame(pmes_q_mvar).to_excel(writer, sheet_name="pmes_q_mvar")
+    #step 3: Creation of the measures forecast for all time steps and for each individual in the population and run the consequent state estimation
+
+    individual_reshape=[]
+    XPMU_ind=[]
+    XINJ_ind=[]
+    XINJpm_ind=[]
+    rest_line_est_df=[]
+     
+    individual_reshape=np.reshape(ind, (3,nb_bus)) #rappel un individu contient dans un seul colonne l'ensemble des couples mesure-bus.Il faut donc le séprarer en 3 pour avoir les couples PMU-bus, inj-bus et pseudo-bus
+    XPMU_ind= individual_reshape[0]
+    XINJ_ind= individual_reshape[1]
+    XINJpm_ind=individual_reshape[2]
+    if deepstudy==1:
+        with pd.ExcelWriter("d:/Documents/PHD/State estimation Bayesian/control.xlsx",engine="openpyxl" ,mode='a') as writer:
+            pd.DataFrame(XPMU_ind).to_excel(writer, sheet_name="XPMU_ind")
+            pd.DataFrame(XINJ_ind).to_excel(writer, sheet_name="XINJ_ind")
+            pd.DataFrame(XINJpm_ind).to_excel(writer, sheet_name="XINJpm")  
+    for ts_id in range(n_ts):
+            #print("Création des prévision pour la période",ts_id+1,"prévisions réalisées au temps", ts_id)
+            for idx in range(len(XPMU_ind)):
+                if XPMU_ind[idx] == 1:
+                    #print("created measure for PMU")
+                    pp.create_measurement(net,meas_type="v", element_type="bus", value=mes_vm_pu[idx][ts_id], std_dev=abs(0.006*mes_vm_pu[idx][ts_id]),element=idx,check_existing=True)
+                    pp.create_measurement(net,meas_type="va", element_type="bus", value=mes_va_de[idx][ts_id], std_dev=abs(0.003*mes_va_de[idx][ts_id]),element=idx,check_existing=True)
+
+                # creation of the injection measurement points
+            for idx in range(len(XINJ_ind)):
+                if XINJ_ind[idx] == 1:
+                    #print("created measure for INJ")
+                    pp.create_measurement(net,meas_type="p", element_type="bus", value=mes_p_mw[idx][ts_id], std_dev=abs(0.006*mes_p_mw[idx][ts_id]),element=idx,check_existing=True)
+                    pp.create_measurement(net,meas_type="q", element_type="bus", value=mes_q_mvar[idx][ts_id], std_dev=abs(0.006*mes_q_mvar[idx][ts_id]),element=idx,check_existing=True)
+        
+            #step 2: creation of the pseudo measures
+            for idx in range(len(XINJpm_ind)):
+                if XINJpm_ind[idx]==1:
+                    #print("created mesaure for Pseudo")
+                    pp.create_measurement(net,meas_type="p", element_type="bus", value=pmes_p_mw[idx][ts_id], std_dev=abs(0.006*pmes_p_mw[idx][ts_id]),element=idx,check_existing=True)
+                    pp.create_measurement(net,meas_type="q", element_type="bus", value=pmes_q_mvar[idx][ts_id], std_dev=abs(0.006*pmes_q_mvar[idx][ts_id]),element=idx,check_existing=True)        
+            #print("création des mesures pour la période",ts_id+1," terminée")
+            est.estimate(net,algorithm="irwls",init='flat', tolerance=1e-04, calculate_voltage_angles="true", zero_injection="aux_bus", maximum_iterations=300)
+            res_line_est=net.res_line_est.loading_percent.to_numpy()
+            #print("estimation de l'état de la période",ts_id," terminée")
+            rest_line_est_df.append(res_line_est)
+
+    return rest_line_est_df
+
+#fonction crée pour tester l'estimateur d'état en prenant le powerfolw comme mesure ce qui correspond à une connaissance parfaite des flux (avec une mesure preque parfaite)
+def estimation_pf(net, ind, n_ts):
+    global rest_line_est_pf
+    print("Estimation avec connaissance parfaite")
+    print("================================") 
+    
+        #step 1: re load result of power flow
+        #/!\ if change in the time serie do not forget to save the result.csv into xls
+        #matrix with pf value of V-pu for each bus and time steps
+    
+    res_bus_pf_vm_pu = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/res_bus/vm_pu.xlsx",sheet_name="Sheet1", index_col=0).to_numpy()
+    pf_vm_pu=np.transpose(res_bus_pf_vm_pu) 
+    
+
+        #matrix with pf value of V angle for each bus and time steps
+    res_bus_pf_va_de = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/res_bus/va_degree.xlsx",sheet_name="Sheet1", index_col=0).to_numpy()
+    pf_va_de=np.transpose(res_bus_pf_va_de) 
+
+        #matrix with pf value of active power for each bus and time steps
+    res_bus_pf_p_mw = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/res_bus/p_mw.xlsx",sheet_name="Sheet1", index_col=0).to_numpy()
+    pf_p_mw=np.transpose(res_bus_pf_p_mw) 
+
+        ##matrix with pf value of reactive power for each bus and time steps
+    res_bus_pf_q_mvar = pd.read_excel("d:/Documents/PHD/State estimation Bayesian/res_bus/q_mvar.xlsx",sheet_name="Sheet1", index_col=0).to_numpy()
+    pf_q_mvar=np.transpose(res_bus_pf_q_mvar)  
+    
+    individual_reshape=[]
+    XPMU_ind=[]
+    XINJ_ind=[]
+    XINJpm_ind=[]
+    rest_line_est_pf=[]
+     
+    individual_reshape=np.reshape(ind, (3,nb_bus)) #rappel un individu contient dans un seul colonne l'ensemble des couples mesure-bus.Il faut donc le séprarer en 3 pour avoir les couples PMU-bus, inj-bus et pseudo-bus
+    XPMU_ind= individual_reshape[0]
+    XINJ_ind= individual_reshape[1]
+    XINJpm_ind=individual_reshape[2]
+    
+    for ts_id in range(n_ts):
+            #print("Création des prévision pour la période",ts_id+1,"prévisions réalisées au temps", ts_id)
+            for idx in range(len(XPMU_ind)):
+                if XPMU_ind[idx] == 1:
+                    #print("created measure for PMU")
+                    pp.create_measurement(net,meas_type="v", element_type="bus", value=pf_vm_pu[idx][ts_id], std_dev=abs(0.006*pf_vm_pu[idx][ts_id]),element=idx,check_existing=True)
+                    pp.create_measurement(net,meas_type="va", element_type="bus", value=pf_va_de[idx][ts_id], std_dev=abs(0.003*pf_va_de[idx][ts_id]),element=idx,check_existing=True)
+
+                # creation of the injection measurement points
+            for idx in range(len(XINJ_ind)):
+                if XINJ_ind[idx] == 1:
+                    #print("created measure for INJ")
+                    pp.create_measurement(net,meas_type="p", element_type="bus", value=pf_p_mw[idx][ts_id], std_dev=abs(0.006*pf_p_mw[idx][ts_id]),element=idx,check_existing=True)
+                    pp.create_measurement(net,meas_type="q", element_type="bus", value=pf_q_mvar[idx][ts_id], std_dev=abs(0.006*pf_q_mvar[idx][ts_id]),element=idx,check_existing=True)
+        
+            #step 2: creation of the pseudo measures
+            for idx in range(len(XINJpm_ind)):
+                if XINJpm_ind[idx]==1:
+                    #print("created mesaure for Pseudo")
+                    pp.create_measurement(net,meas_type="p", element_type="bus", value=pf_p_mw[idx][ts_id], std_dev=abs(0.006*pf_p_mw[idx][ts_id]),element=idx,check_existing=True)
+                    pp.create_measurement(net,meas_type="q", element_type="bus", value=pf_q_mvar[idx][ts_id], std_dev=abs(0.006*pf_q_mvar[idx][ts_id]),element=idx,check_existing=True)        
+            #print("création des mesures pour la période",ts_id+1," terminée")
+            est.estimate(net,algorithm="irwls",init='flat', tolerance=1e-04, calculate_voltage_angles="true", zero_injection="aux_bus", maximum_iterations=300)
+            res_line_est=net.res_line_est.loading_percent.to_numpy()
+            #print("estimation de l'état de la période",ts_id," terminée")
+            rest_line_est_pf.append(res_line_est)
+
+    return rest_line_est_pf
+
+# fonction qui permet de générer l'Active network management basé sur les séries temporelles exactes de % de charge des câbles (et, en option) % de la tension au bus
+def ANM_PF():
+    global curtailed_pf, list_congested_times_pf
+    data_lines=[]
+        
+    #step 1: create data source
+    data_lines = pd.read_csv("d:/Documents/PHD/State estimation Bayesian/res_line/loading_percent.csv",index_col=0)
+    #it is possible to create an ANM also based on voltage issues. Therefore, we need to create a data source for each bus
+    # data_volt_bus=[]
+    # data_volt_bus= pd.read_csv("d:/Documents/PHD/State estimation Bayesian/res_bus/vm_pu.csv",index_col=0)   
+                 
+    #step 2: check any overloaded lines and curtailed if it occurs
+    #asumption max current for cable = 250 A (NA2XS2Y 1x95 RM/25 12/20 kV)
+    Current=[]
+    exceeded_lines=[]
+    exceeded_current=[]
+    exceeded_power=[]
+    list_congested_times_pf=np.zeros((95,95))
+    curtailed_pf=0
+    
+    Current= data_lines*250/100-250 #./. par 100 pour revenir au %
+    exceeded_lines = Current > 0
+    exceeded_current=(Current*exceeded_lines)
+    exceeded_power=sqrt(3)*20*exceeded_current #calcul de la puissance excédentaire
+    curtailed_pf=exceeded_power.values.sum()
+    print("the minimum curtailed power based on exact power flow is: ",curtailed_pf)
+    
+    #step3: create a list of the time stamp with congestion
+    for y in range(len(rest_line_est_pf)):
+        if any(x>100 for x in rest_line_est_pf[y]):
+            list_congested_times_pf[y]=1
+        else:
+            list_congested_times_pf[y]=0             
+    return curtailed_pf, list_congested_times_pf
+
+# fonction qui permet de générer l'Active network management basé sur les séries temporelles ESTIMEE via LES MESURES de % de charge des câbles (et, en option) % de la tension au bus
+def ANM_EST():
+    global curtailed_est_ind, penalties      
+    Current_est=[]
+    exceeded_lines_est=[]
+    exceeded_current_est=[]
+    exceeded_power_est=[]
+    curtailed_est_ind=0
+    penalties=0.0
+    list_congested_times=np.zeros((95,95))
+    Current_est= pd.DataFrame(rest_line_est_df)*250/100-250 #./. par 100 pour revenir au %
+    exceeded_lines_est = Current_est > 0
+    exceeded_current_est=(Current_est*exceeded_lines_est)
+    exceeded_power_est=sqrt(3)*20*exceeded_current_est #calcul de la puissance excédentaire
+    curtailed_est_ind=exceeded_power_est.values.sum()
+    #print("the curtailed power for individu is: ",curtailed_est_ind)
+    
+    #controle faux positif et faux négatif
+    for y in range(len(rest_line_est_df)):
+        if any(x>100 for x in rest_line_est_df[y]):
+            list_congested_times[y]=1
+        else:
+            list_congested_times[y]=0
+    for w in range(len(rest_line_est_df)):
+        if all(list_congested_times[w])==all(list_congested_times_pf[w]):
+            penalties=penalties+0
+        else:
+            penalties=penalties+500 #500 = cost of penalties for worng positive and wrong negative
+    if curtailed_est_ind<curtailed_pf:
+        penalties=penalties+1000 # 1000 = cost of penalties to have not detected enough congestion
+        
+    #print("the total penalty is: ",penalties)
+    curtailed_est_ind=curtailed_est_ind+penalties
+    if(deepstudy==1 ):
+        with pd.ExcelWriter("d:/Documents/PHD/State estimation Bayesian/control.xlsx",engine="openpyxl" ,mode='a') as writer:
+            pd.DataFrame(rest_line_est_df).to_excel(writer, sheet_name="rest_line_est")
+            pd.DataFrame(Current_est).to_excel(writer, sheet_name="Current_est")
+            pd.DataFrame(exceeded_current_est).to_excel(writer, sheet_name="exceeded_current_est")
+
+    return curtailed_est_ind, penalties
+
+
+
+def evaluate_population2():
+    global df_fitness_score_pop
+    
+    for z in range(len(population)):
+        k=population[z]
+        score=0
+        penalties_sum_est=0
+        test_net()
+        estimation_pf(net, k, j)
+        ANM_PF()
+        for w in range(10): #on fait tourner 10 simulations de prise de mesures
+            estimate_population(net, k, j)      
+            ANM_EST()
+            score=score+curtailed_est_ind-curtailed_pf
+            penalties_sum_est=penalties_sum_est+penalties
+        #print("Pour l'individu ",z,"l'écart entre le power flow et l'estimateur est de :",score)
+        df_fitness_score_pop.loc[len(df_fitness_score_pop)] = [k, 1/(score/10),penalties_sum_est/10,0] # attention: la fonction objective est un min => le score = 1/ l'écart entre l'estimation et le powerflow
+    
+    
+    
+    return df_fitness_score_pop
+
+def select_parents2(): #selctionne un ombre de parents pour l'algo génétique min =2 ou un nombre pair
+    global df_parents
+  
+    fitness_sum = df_fitness_score_pop['score'].sum()
+    df_fitness_score_pop['probability'] = df_fitness_score_pop.apply(lambda row: row.score /fitness_sum, axis=1) 
+    for i in range(2):
+        # Sélectionner un parent avec une probabilité proportionnelle à son score de fitness
+        parent_index = np.random.choice(range(len(df_fitness_score_pop)), p=np.array(df_fitness_score_pop['probability']))    
+        df_parents.loc[len(df_parents)]=df_fitness_score_pop.loc[parent_index]
+    print(df_parents)
+    return df_parents
+
+def pairing(n1,n2):
+       #préparation des variables
+    global new_population
+    
+    new_list_meas_pop=[]
+    new_population=[]
+    child_XPMU= [0] * nb_bus
+    child_XINJ= [0] * nb_bus 
+    
+    bus_without_pmu=[]
+    bus_without_inj=[]
+    bus_without_mes=[]
+    compl_child_pmu = [0] * nb_bus
+    compl_child_inj=[0] * nb_bus
+    
+    sum_XPMU_child=0
+    sum_XINJ_child=0
+
+    new_XPMU= [0] * nb_bus
+    new_XINJpm= [0] * nb_bus
+    new_XINJ= [0] * nb_bus
+    new_XPMU= [0] * nb_bus
+    XMES=[0] * nb_bus
+
+    new_assigned_bus_n1=[]
+    new_assigned_bus_n2=[]
+    new_assigned_bus_n3=[]
+    
+    parent1=df_parents.loc[0]
+    parent2=df_parents.loc[1]
+    #print("parents:", np.array(parent1['Individu']) , np.array(parent2['Individu']))
+    child=np.array(parent1['Individu'])*np.array(parent2['Individu']) #conserve la position d'un appareillage si l'emplacement est le même chez les deux parents
+    
+    #établissement de la liste dont les bus sont pourvus d'une mesure dans child
+    #pour cela, il faut re-séparer child par type de mesure dans child
+    new_individual_reshape=np.reshape(child, (3,nb_bus)) #rappel un individu contient dans un seul colonne l'ensemble des couples mesure-bus.Il faut donc le séprarer en 3 pour avoir les couples PMU-bus, inj-bus et pseudo-bus
+    child_XPMU= new_individual_reshape[0]
+    child_XINJ= new_individual_reshape[1]
+    #child_XINJpm=new_individual_reshape[2] (pour éventuel controle)
+    #vérification du nombre d'appareil de mesure de child
+    sum_XPMU_child=np.sum([child_XPMU])
+    sum_XINJ_child=np.sum([child_XINJ])
+    #sum_XINJpm_child=child_XINJpm.sum()
+    #print("le child crée par le pairing a déjà", sum_XPMU_child, "PMU et",sum_XINJ_child,'INJ')
+    
+    #on commence par les PMU
+    if sum_XPMU_child==n1: #si le nombre de PMU est déjà ok, alors on garde l'entièreté du child
+        new_XPMU=child_XPMU
+    else:
+        for i in range(nb_bus): #détecte les bus où il n'y a pas de PMU dans child PMU
+            if new_XPMU[i] == 0:
+                bus_without_pmu.append(i)
+        new_assigned_bus_n1=np.random.choice(bus_without_pmu,n1-sum_XPMU_child,replace=False) #choisi au hasard les bus qui recevront un PMU ~ mutation de la population
+        for bus in new_assigned_bus_n1:
+            compl_child_pmu[bus]=1
+        new_XPMU=child_XPMU+compl_child_pmu
+    
+    #on continue avec les inj
+    if sum_XINJ_child==n2: #si le nombre de INJ est déjà ok, alors on garde l'entièreté du child
+        new_XINJ=child_XINJ
+    else:
+        for i in range(nb_bus): #détecte les bus où il n'y a pas de PMU dans child PMU
+            if new_XPMU[i] == 0 and child_XINJ[i]==0:
+                bus_without_inj.append(i)
+        new_assigned_bus_n2=np.random.choice(bus_without_inj,n2-sum_XPMU_child-sum_XINJ_child,replace=False) #choisi au hasard les bus qui recevront un INJ ~ mutation de la population
+        
+        for bus in new_assigned_bus_n2:
+            compl_child_inj[bus]=1
+        new_XINJ=child_XINJ+compl_child_inj
+    
+    #on termine avec les pseudo mesures
+    #détermination des bus qui n'ont ni PMU ni INJ
+    XMES=new_XINJ+new_XPMU
+    sum_XMES=np.sum(XMES) 
+    for i in range(nb_bus): #détecte les bus où il n'y a pas de PMU dans child PMU
+            if XMES[i] == 0:
+                bus_without_mes.append(i)
+    new_assigned_bus_n3=np.random.choice(bus_without_mes,nb_bus-sum_XMES,replace=False) #choisi au hasard les bus qui recevront un pseudo ~ mutation de la population
+    for bus in new_assigned_bus_n3:
+        new_XINJpm[bus]=1
+                   
+        
+    
+    #la fonction suivante permet de vérifier que tous les bus sont bien été assignés
+    controle=[i+j+k for i,j,k in zip(new_XPMU,new_XINJ,new_XINJpm)]
+    new_list_meas_pop=[*new_XPMU , *new_XINJ, *new_XINJpm]
+    new_population.append(new_list_meas_pop)
+    #print("Child population:", new_population)
+    #print("contole 1 de child",controle)
+    #print("controle 2 de child: nbre de PMU de child",np.sum(new_XPMU), "nbre de INj de child",np.sum(new_XINJ),"nbre de pseudo de child", np.sum(new_XINJpm))
+    #print('bus child avec PMU:',new_XPMU)
+    #print('bus child avec INJ:',new_XINJ)
+    #print('bus child avec Pseudo:',new_XINJpm)
+    
+    
+    
+    return new_population
+j=95
+pmu=2
+inj=30
+pop=10
+nbr_max_iterations=30
+test_net()
+pf_timeserie(j)
+deepstudy=0 #permet de logger les différentes valeurs dans l'xls Controle pour permettre une analyse en profondeur
+#note: si on place trop de PMU, l'estimateur d'état diverge assez fort et le bus de fin de circuit "recoivent" toutes les erreurs
+generate_population(pmu,inj,nb_bus,pop)
+#    print("nombre d'individus dans la population", len(population))
+#    for i in  range(len(population)): 
+#             ind=population[i]
+evaluate_population2()
+g=0
+while g<nbr_max_iterations+1:
+    
+    select_parents2()
+    pairing(pmu,inj)
+    population=new_population
+    print("lancement de l'évaluation du child:",g)
+    print("--------------------------------")
+    evaluate_population2()
+    print('le nombre total d individus testés est de :',len(df_fitness_score_pop))
+    print("test df fitness score :",df_fitness_score_pop)
+    best_individual1=df_fitness_score_pop.iloc[df_fitness_score_pop['score'].idxmax()] 
+    best_individual2=df_fitness_score_pop.iloc[df_fitness_score_pop['penalties'].astype(float).idxmin()]   
+    if best_individual1['score']> 1/(1.1*curtailed_pf):
+        print("Best solution found based on score is:",best_individual1)
+        break
+    elif best_individual2['penalties']<1000:
+        print("Best solution found based on penalties is:",best_individual2)
+        break
+    else:
+        print("No good enough solution found so far. Keep going")
+        g=g+1
+
+if g==nbr_max_iterations:
+    print("Number of max iterations has been reached:Best solution found so far is:",best_individual1)
+
+best_individual1_reshape=np.reshape(np.array(best_individual1['Individu']), (3,nb_bus)) #rappel un individu contient dans un seul colonne l'ensemble des couples mesure-bus.Il faut donc le séprarer en 3 pour avoir les couples PMU-bus, inj-bus et pseudo-bus
+sol1_XPMU= best_individual1[0]
+sol1_XINJ= best_individual1[1]
+print(sol1_XPMU)
+print(sol1_XINJ)
+best_individual2_reshape=np.reshape(np.array(best_individual2['Individu']), (3,nb_bus)) #rappel un individu contient dans un seul colonne l'ensemble des couples mesure-bus.Il faut donc le séprarer en 3 pour avoir les couples PMU-bus, inj-bus et pseudo-bus
+sol2_XPMU= best_individual2[0]
+sol2_XINJ= best_individual2[1]
+
+with pd.ExcelWriter("d:/Documents/PHD/State estimation Bayesian/Opti final results.xlsx",engine="openpyxl" ,mode='a') as writer:
+            best_individual1.to_excel(writer, sheet_name="best_individual1")
+            best_individual2.to_excel(writer, sheet_name="best_individual2")
+            pd.DataFrame(sol1_XPMU).to_excel(writer, sheet_name="best_ind1_PMU")
+            pd.DataFrame(sol1_XINJ).to_excel(writer, sheet_name="best_ind1_INJ")
+            pd.DataFrame(sol2_XPMU).to_excel(writer, sheet_name="best_ind2_PMU")
+            pd.DataFrame(sol2_XINJ).to_excel(writer, sheet_name="best_ind2_INJ")
