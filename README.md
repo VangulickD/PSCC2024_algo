@@ -17,3 +17,8 @@ For the sake of simplicity without loss of generality, as the set of measurement
     \item $\gamma$= \EUR{1000}
     \item $\eta$= 127.61\EUR{/MWh}
 
+**Illustration of the load pattern for scenarios A and B**
+The illustrated load curve show the exchange of power at the slackbus
+![loadprofile(3)](https://github.com/VangulickD/PSCC2024_algo/assets/35199822/749fc807-ec05-484e-91a7-fc65a3c73dc0)
+
+![loadprofile(3b)](https://github.com/VangulickD/PSCC2024_algo/assets/35199822/9c91be1c-2317-47ae-9767-8eeb0ac0d3ab)
